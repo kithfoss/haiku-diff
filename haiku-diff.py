@@ -17,6 +17,7 @@ import subprocess
 import sys
 import re
 import os
+import json
 import argparse
 from collections import defaultdict
 
@@ -157,43 +158,107 @@ def parse_diff(diff_text):
     return files
 
 
+def _get_symbol_patterns(ext):
+    """Return a list of compiled patterns for named symbol extraction."""
+    if ext in (".py",):
+        return [re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+(\w+)")]
+    elif ext in (".js", ".ts", ".jsx", ".tsx", ".mjs"):
+        return [
+            # Named function declarations (including generators and async)
+            re.compile(
+                r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s+(\w+)\s*\("
+            ),
+            # Class declarations (including abstract in TS)
+            re.compile(
+                r"^\s*(?:export\s+)?(?:abstract\s+)?(?:default\s+)?class\s+(\w+)[\s<({]"
+            ),
+            # Arrow functions and function expressions:
+            # const/let/var NAME [: TS type] = [async] (params) => or x => or function
+            # The optional TS type annotation is consumed by (?:\s*:[^=]+)? which stops
+            # at the first = (the assignment operator).
+            re.compile(
+                r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)"
+                r"(?:\s*:[^=]+)?"           # optional TypeScript type annotation
+                r"\s*=\s*(?:async\s+)?"
+                r"(?:\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>|function\b)"
+            ),
+        ]
+    elif ext in (".go",):
+        return [re.compile(r"^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(")]
+    elif ext in (".rb",):
+        return [re.compile(r"^\s*(?:def|class|module)\s+(\w+)")]
+    elif ext in (".rs",):
+        return [re.compile(r"^\s*(?:pub\s+)?(?:fn|struct|enum|trait|impl)\s+(\w+)")]
+    elif ext in (".java", ".kt", ".cs"):
+        return [re.compile(
+            r"^\s*(?:public|private|protected|static|abstract|override|\s)*"
+            r"(?:class|interface|enum|void|\w+)\s+(\w+)\s*(?:\(|<|\{)"
+        )]
+    return []
+
+
+def _extract_python_symbols(lines):
+    """Python-specific symbol extraction that understands decorators.
+
+    Associates each def/class with its outermost decorator so that
+    `@router.get("/") async def endpoint()` shows as `endpoint (@router.get)`
+    rather than just `endpoint`.
+    """
+    added = []
+    removed = []
+    pending = {}  # sign -> first decorator name seen for that sign
+
+    for line in lines:
+        if not line or line[0] not in ("+", "-"):
+            pending.clear()
+            continue
+        sign = line[0]
+        stripped = line[1:]
+
+        dec_m = re.match(r"^\s*@([\w.]+)", stripped)
+        if dec_m:
+            if sign not in pending:  # keep outermost (first) decorator
+                pending[sign] = dec_m.group(1)
+            continue
+
+        func_m = re.match(r"^\s*(?:async\s+)?(?:def|class)\s+(\w+)", stripped)
+        if func_m:
+            name = func_m.group(1)
+            if len(name) > 1:
+                dec = pending.get(sign)
+                display = f"{name} (@{dec})" if dec else name
+                (added if sign == "+" else removed).append(display)
+            pending.pop(sign, None)
+            continue
+
+        pending.pop(sign, None)
+
+    return added, removed
+
+
 def extract_symbols(lines, ext):
     """Extract added/removed named symbols (functions, classes, etc.)."""
+    if ext in (".py",):
+        return _extract_python_symbols(lines)
+
     added = []
     removed = []
 
-    # Patterns by language family
-    if ext in (".py",):
-        pattern = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+(\w+)")
-    elif ext in (".js", ".ts", ".jsx", ".tsx", ".mjs"):
-        pattern = re.compile(
-            r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s+(\w+)|"
-            r"class\s+(\w+)|const\s+(\w+)\s*=\s*(?:async\s*)?\(|"
-            r"(?:let|var)\s+(\w+)\s*=\s*function)"
-        )
-    elif ext in (".go",):
-        pattern = re.compile(r"^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(")
-    elif ext in (".rb",):
-        pattern = re.compile(r"^\s*(?:def|class|module)\s+(\w+)")
-    elif ext in (".rs",):
-        pattern = re.compile(r"^\s*(?:pub\s+)?(?:fn|struct|enum|trait|impl)\s+(\w+)")
-    elif ext in (".java", ".kt", ".cs"):
-        pattern = re.compile(
-            r"^\s*(?:public|private|protected|static|abstract|override|\s)*"
-            r"(?:class|interface|enum|void|\w+)\s+(\w+)\s*(?:\(|<|\{)"
-        )
-    else:
+    patterns = _get_symbol_patterns(ext)
+    if not patterns:
         return added, removed
 
     for line in lines:
         if not line or line[0] not in ("+", "-"):
             continue
         stripped = line[1:]
-        m = pattern.match(stripped)
-        if m:
-            name = next((g for g in m.groups() if g), None)
-            if name and not name.startswith("_test") and len(name) > 1:
-                (added if line[0] == "+" else removed).append(name)
+        for pat in patterns:
+            m = pat.match(stripped)
+            if m:
+                name = next((g for g in m.groups() if g), None)
+                if name and not name.startswith("_test") and len(name) > 1:
+                    (added if line[0] == "+" else removed).append(name)
+                break  # first matching pattern wins per line
 
     return added, removed
 
@@ -379,6 +444,73 @@ def _colorize_tags(description: str, style: "_Style") -> str:
     return description
 
 
+def _file_tags(path, lines):
+    """Return a list of semantic tag strings for a file."""
+    filename = os.path.basename(path)
+    ext = os.path.splitext(path)[1].lower()
+    tags = []
+    if filename in ("package-lock.json", "yarn.lock", "Pipfile.lock", "poetry.lock", "go.sum"):
+        tags.append("lockfile")
+    elif bool(re.search(r"test|spec", filename, re.I)):
+        tags.append("test")
+    elif ext in (".json", ".yaml", ".yml", ".toml", ".ini", ".env", ".cfg", ".conf"):
+        tags.append("config")
+    elif ext in (".md", ".rst", ".txt"):
+        tags.append("docs")
+    return tags
+
+
+def build_json_output(diff_text):
+    """Return a dict suitable for JSON serialization."""
+    if not diff_text.strip():
+        return {"changed": 0, "additions": 0, "deletions": 0, "files": []}
+
+    files_data = parse_diff(diff_text)
+    total_add = 0
+    total_del = 0
+    file_entries = []
+
+    # Sort by total change size descending (matches text output order).
+    def change_size(item):
+        data = item[1]
+        a = sum(1 for l in data["lines"] if l.startswith("+"))
+        d = sum(1 for l in data["lines"] if l.startswith("-"))
+        return a + d
+
+    for path, data in sorted(files_data.items(), key=change_size, reverse=True):
+        ext = os.path.splitext(path)[1].lower()
+        lines = data["lines"]
+        additions = sum(1 for l in lines if l.startswith("+"))
+        deletions = sum(1 for l in lines if l.startswith("-"))
+        total_add += additions
+        total_del += deletions
+
+        syms_added, syms_removed = extract_symbols(lines, ext)
+        imports_added = list(dict.fromkeys(extract_imports(lines, ext)))
+        tags = _file_tags(path, lines)
+        description = classify_file(path, data)
+
+        file_entries.append({
+            "path": path,
+            "additions": additions,
+            "deletions": deletions,
+            "is_new": data["new"],
+            "is_deleted": data["deleted"],
+            "symbols_added": syms_added,
+            "symbols_removed": syms_removed,
+            "imports_added": imports_added,
+            "tags": tags,
+            "description": description,
+        })
+
+    return {
+        "changed": len(file_entries),
+        "additions": total_add,
+        "deletions": total_del,
+        "files": file_entries,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="haiku-diff",
@@ -408,6 +540,11 @@ def main():
         action="store_true",
         help="one line per file, no blank-line padding",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="output structured JSON (for scripting/CI; ignores --color and --short)",
+    )
     parser.add_argument("files", nargs="*", help="limit to specific files")
 
     args = parser.parse_args()
@@ -418,9 +555,14 @@ def main():
         print("Not a git repository.", file=sys.stderr)
         sys.exit(1)
 
-    style = _Style(_decide_color(args.color))
     diff, stat = get_diff(args)
-    print(summarize_diff(diff, stat, style=style, short=args.short))
+
+    if args.json:
+        result = build_json_output(diff)
+        print(json.dumps(result, indent=2))
+    else:
+        style = _Style(_decide_color(args.color))
+        print(summarize_diff(diff, stat, style=style, short=args.short))
 
 
 if __name__ == "__main__":
